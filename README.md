@@ -119,15 +119,26 @@ azure-maf-oncall/
 │   └── bicepconfig.json
 ├── src/
 │   ├── functions/
-│   │   ├── Interpreters/          # AI interpretation Functions
-│   │   ├── Notifiers/             # Email/SMS/Voice Functions
-│   │   └── Shared/                # Shared function helpers
+│   │   ├── Interpreters/
+│   │   │   └── interpretFinding.js    # Event Grid trigger -> Azure OpenAI -> queue
+│   │   ├── Notifiers/
+│   │   │   ├── notifyOnCall.js        # Storage queue trigger -> Email/SMS/Voice
+│   │   │   └── callEventsWebhook.js   # HTTP trigger -> plays TTS on call connect
+│   │   └── Shared/
+│   │       ├── config.js
+│   │       ├── openAiClient.js
+│   │       ├── acsClients.js
+│   │       ├── interpretation.js
+│   │       ├── emailTemplate.js
+│   │       └── notify.js
 │   ├── agents/                    # Custom sub-agents/tools
 │   ├── services/                  # Business logic
 │   └── utils/                     # Shared helpers
-├── tests/                         # Unit + integration tests
+├── tests/                         # Jest unit tests (mocked OpenAI/ACS clients)
 ├── docs/                          # PRD, architecture, runbooks
 ├── scripts/                       # Deployment/setup scripts
+├── host.json
+├── local.settings.json.example
 ├── .env.example
 └── package.json
 ```
@@ -155,9 +166,11 @@ Repeat with `staging.parameters.json` / `prod.parameters.json` for other environ
 
 ```bash
 npm install
-cp .env.example .env    # fill in Azure OpenAI / ACS / Event Grid values
+cp local.settings.json.example local.settings.json   # fill in Azure OpenAI / ACS / Event Grid values
 npm start                # runs Azure Functions locally via Core Tools
 ```
+
+`local.settings.json` is what the Functions host reads at runtime (`.env.example` documents the same variables for non-Functions contexts like tests/scripts).
 
 Run linting and tests:
 
@@ -180,6 +193,10 @@ Environment variables (see [.env.example](.env.example)):
 | `ACS_CONNECTION_STRING` | Azure Communication Services connection string |
 | `ACS_SENDER_EMAIL` | Verified sender email domain address |
 | `ACS_SENDER_PHONE_NUMBER` | ACS phone number for SMS/Voice |
+| `ONCALL_EMAIL` | Destination email address for notifications |
+| `ONCALL_PHONE_NUMBER` | Destination phone number for SMS/Voice notifications |
+| `CALL_EVENTS_CALLBACK_URL` | Public URL of the deployed `callEventsWebhook` function (required for voice) |
+| `APPROVAL_BASE_URL` | Base URL for remediation approval links (optional) |
 | `EVENT_GRID_TOPIC_ENDPOINT` | Event Grid topic endpoint for SRE Agent ingestion |
 | `EVENT_GRID_TOPIC_KEY` | Event Grid topic access key |
 | `APPLICATIONINSIGHTS_CONNECTION_STRING` | App Insights connection string |
@@ -192,11 +209,13 @@ In Azure, these are wired as Function App settings by [infra/modules/functions.b
 ## Usage & Testing
 
 1. Point your Azure SRE Agent (or a test harness) at the Event Grid topic output by `sre-agent.bicep`.
-2. Publish a sample investigation payload (findings, root cause, proposed mitigations).
-3. The Interpreter function summarizes it via Azure OpenAI and hands off to the Notifier.
-4. Verify Email/SMS/Voice delivery, and check the trace in Application Insights.
+2. Publish a sample investigation payload (findings, root cause, proposed mitigations) as the event's `data`.
+3. [`interpretFinding`](src/functions/Interpreters/interpretFinding.js) (Event Grid trigger) summarizes it via Azure OpenAI and writes the structured result to the `interpreted-findings` storage queue.
+4. [`notifyOnCall`](src/functions/Notifiers/notifyOnCall.js) (storage queue trigger) sends Email, SMS, and a TTS phone call via ACS. Voice playback is driven by [`callEventsWebhook`](src/functions/Notifiers/callEventsWebhook.js), which Call Automation invokes once the call connects.
+5. If every channel fails (or all are unconfigured), the queue message is retried and eventually lands in the `interpreted-findings-poison` queue rather than being silently dropped.
+6. Verify delivery, and check the trace in Application Insights.
 
-Unit and integration tests live under [tests/](tests/) and run via `npm test` (Jest).
+Unit tests live under [tests/](tests/) and run via `npm test` (Jest) — they cover severity/action validation in the Interpreter, per-channel skip/send behavior in the Notifier, and HTML escaping in the email template. They mock the Azure OpenAI and ACS clients, so no live Azure resources are required to run them.
 
 ---
 
